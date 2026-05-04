@@ -1,123 +1,139 @@
-import streamlit as st 
+import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 import math
 import json
 import hashlib
-from supabase import create_client, Client
+import sqlite3
+from contextlib import contextmanager
 
 # ============================================================================
-# CONFIGURACIÓN INICIAL G
+# CONFIGURACIÓN INICIAL
 # ============================================================================
 st.set_page_config(page_title="Sistema Hotelero CA13", page_icon="🏨", layout="wide")
 
 # ============================================================================
-# CONEXIÓN A SUPABASE (Persistencia en la Nube)
+# CONEXIÓN A SQLITE (Persistencia con librería estándar)
 # ============================================================================
-try:
-    SUPABASE_URL = st.secrets["https://santdbbuwwofahucbyzb.supabase.co/rest/v1/"]
-    SUPABASE_KEY = st.secrets["eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNhbnRkYmJ1d3dvZmFodWNieXpiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc5MDg3NzgsImV4cCI6MjA5MzQ4NDc3OH0.3MOLvuahpPtJvXaL_a5yqEM5VJB_pLWHInQvNzNqHx8"]
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    DB_AVAILABLE = True
-except KeyError:
-    # Modo desarrollo local sin Supabase configurado
-    DB_AVAILABLE = False
-    supabase = None
-    st.warning("⚠️ Modo local: Los datos NO persistirán al recargar. Configura SUPABASE_URL y SUPABASE_KEY en Secrets.")
+DB_PATH = "hotel_data.db"
 
-# ============================================================================
-# FUNCIONES DE BASE DE DATOS (Supabase)
-# ============================================================================
-def db_upsert(table: str, data: dict, pk_column: str = "numero"):
-    """Inserta o actualiza un registro en Supabase"""
-    if not DB_AVAILABLE or not supabase:
-        return None
+@contextmanager
+def get_db():
+    """Context manager para conexión SQLite"""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
     try:
-        response = supabase.table(table).upsert(data, on_conflict=pk_column).execute()
-        return response.data
-    except Exception as e:
-        st.error(f"❌ Error en DB upsert ({table}): {e}")
-        return None
-
-def db_select(table: str, filters: dict = None, order_by: str = None):
-    """Consulta registros desde Supabase"""
-    if not DB_AVAILABLE or not supabase:
-        return []
-    try:
-        query = supabase.table(table).select("*")
-        if filters:
-            for col, val in filters.items():
-                query = query.eq(col, val)
-        if order_by:
-            query = query.order(order_by)
-        response = query.execute()
-        return response.data or []
-    except Exception as e:
-        st.warning(f"⚠️ Error en DB select ({table}): {e}")
-        return []
-
-def db_insert_historial(tipo_registro: str, data: dict):
-    """Inserta un nuevo registro en el historial"""
-    if not DB_AVAILABLE or not supabase:
-        return None
-    try:
-        response = supabase.table("historial").insert({
-            "tipo_registro": tipo_registro,
-            "data": data
-        }).execute()
-        return response.data
-    except Exception as e:
-        st.error(f"❌ Error insertando historial: {e}")
-        return None
+        yield conn
+    finally:
+        conn.close()
 
 def init_db_tables():
-    """Inicializa datos base si las tablas están vacías"""
-    if not DB_AVAILABLE:
-        return
-    
-    # Verificar si ya hay habitaciones
-    existing = db_select("habitaciones")
-    if not existing:
-        # Crear habitaciones estándar
-        for numero, tipo in HABITACIONES_STD:
-            db_upsert("habitaciones", {
-                "numero": numero, "tipo": tipo, "estado": "Disponible",
-                "cliente": None, "reserva": None, "obs": "", "inicio": None,
-                "tipo_pago_priv": None, "horas_extra_priv": 0, "penalizaciones": 0
-            }, pk_column="numero")
-        # Crear privadas
-        for privada in PRIVADAS:
-            db_upsert("habitaciones", {
-                "numero": privada, "tipo": "PRIVADA", "estado": "Disponible",
-                "cliente": None, "reserva": None, "obs": "", "inicio": None,
-                "tipo_pago_priv": None, "horas_extra_priv": 0, "penalizaciones": 0
-            }, pk_column="numero")
-        st.success("✅ Base de datos inicializada correctamente")
+    """Crea las tablas si no existen"""
+    with get_db() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS habitaciones (
+            numero TEXT PRIMARY KEY, tipo TEXT, estado TEXT, 
+            cliente TEXT, reserva TEXT, obs TEXT, inicio TEXT,
+            tipo_pago_priv TEXT, horas_extra_priv INTEGER DEFAULT 0, 
+            penalizaciones INTEGER DEFAULT 0, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS historial (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tipo_registro TEXT, data TEXT, 
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS empresas (
+            nombre TEXT PRIMARY KEY, rtn TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        conn.commit()
+
+def db_upsert(table: str, data: dict, pk_column: str = "numero"):
+    """Inserta o actualiza registro (UPSERT)"""
+    try:
+        with get_db() as conn:
+            if table == "habitaciones":
+                # Para habitaciones: INSERT OR REPLACE por número
+                columns = ', '.join(data.keys())
+                placeholders = ', '.join(['?' for _ in data])
+                conn.execute(f'''INSERT OR REPLACE INTO {table} ({columns}) VALUES ({placeholders})''', 
+                           tuple(data.values()))
+            else:
+                # Para historial/empresas: INSERT normal
+                columns = ', '.join(data.keys())
+                placeholders = ', '.join(['?' for _ in data])
+                conn.execute(f'''INSERT INTO {table} ({columns}) VALUES ({placeholders})''', 
+                           tuple(data.values()))
+            conn.commit()
+            return True
+    except Exception as e:
+        st.error(f"❌ Error guardando en DB: {e}")
+        return False
+
+def db_select(table: str, filters: dict = None, order_by: str = None):
+    """Consulta registros con filtros opcionales"""
+    try:
+        with get_db() as conn:
+            query = f"SELECT * FROM {table}"
+            params = []
+            if filters:
+                conditions = ' AND '.join([f"{k} = ?" for k in filters.keys()])
+                query += f" WHERE {conditions}"
+                params = list(filters.values())
+            if order_by:
+                query += f" ORDER BY {order_by}"
+            cursor = conn.execute(query, params)
+            rows = cursor.fetchall()
+            # Convertir Row a dict y deserializar JSON fields
+            results = []
+            for row in rows:
+                d = dict(row)
+                # Deserializar campos JSON
+                for field in ['cliente', 'reserva', 'data']:
+                    if field in d and isinstance(d[field], str) and d[field].strip().startswith('{'):
+                        try:
+                            d[field] = json.loads(d[field])
+                        except:
+                            pass
+                results.append(d)
+            return results
+    except Exception as e:
+        st.warning(f"⚠️ Error consultando DB: {e}")
+        return []
+
+def db_insert_historial(tipo_registro: str,  dict):
+    """Inserta nuevo registro en historial"""
+    try:
+        with get_db() as conn:
+            conn.execute("INSERT INTO historial (tipo_registro, data) VALUES (?, ?)", 
+                        (tipo_registro, json.dumps(data, default=str)))
+            conn.commit()
+            return True
+    except Exception as e:
+        st.error(f"❌ Error insertando historial: {e}")
+        return False
 
 # ============================================================================
-# FUNCIONES DE AUTENTICACIÓN (con Secrets)
+# FUNCIONES DE AUTENTICACIÓN (con fallback local)
 # ============================================================================
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
 def authenticate(username: str, password: str) -> dict:
-    """Verifica credenciales usando st.secrets"""
+    """Verifica credenciales"""
+    # Intentar usar secrets primero
     try:
-        secrets = st.secrets
-        users = {
-            "admin": {"password": hash_password(secrets.get("ADMIN_PASSWORD", "12345")), "role": "admin", "name": "Administrador"},
-            "hotelca13": {"password": hash_password(secrets.get("HOTEL_PASSWORD", "123456789")), "role": "user", "name": "Hotel CA13"}
-        }
-        if username in users and users[username]["password"] == hash_password(password):
-            return users[username]
-    except Exception:
-        # Fallback para desarrollo local
-        fallback = {
-            "admin": {"password": hash_password("12345"), "role": "admin", "name": "Administrador"},
-            "hotelca13": {"password": hash_password("123456789"), "role": "user", "name": "Hotel CA13"}
-        }
-        if username in fallback and fallback[username]["password"] == hash_password(password):
-            return fallback[username]
+        admin_pass = st.secrets.get("ADMIN_PASSWORD", "12345")
+        hotel_pass = st.secrets.get("HOTEL_PASSWORD", "123456789")
+    except:
+        admin_pass = "12345"
+        hotel_pass = "123456789"
+    
+    users = {
+        "admin": {"password": hash_password(admin_pass), "role": "admin", "name": "Administrador"},
+        "hotelca13": {"password": hash_password(hotel_pass), "role": "user", "name": "Hotel CA13"}
+    }
+    if username in users and users[username]["password"] == hash_password(password):
+        return users[username]
     return None
 
 # ============================================================================
@@ -183,43 +199,43 @@ def init_session_state():
         if key not in st.session_state:
             st.session_state[key] = 0
     
-    # Cargar habitaciones desde Supabase
+    # Inicializar DB
+    init_db_tables()
+    
+    # Cargar habitaciones desde DB
     if 'habitaciones' not in st.session_state:
-        if DB_AVAILABLE:
-            db_rooms = db_select("habitaciones")
-            if db_rooms:
-                st.session_state.habitaciones = {r['numero']: r for r in db_rooms}
-            else:
-                init_db_tables()
-                db_rooms = db_select("habitaciones")
-                st.session_state.habitaciones = {r['numero']: r for r in db_rooms} if db_rooms else {}
+        db_rooms = db_select("habitaciones")
+        if db_rooms:
+            st.session_state.habitaciones = {r['numero']: r for r in db_rooms}
         else:
-            # Fallback local para desarrollo
-            st.session_state.habitaciones = {n: {'numero': n, 'tipo': t, 'estado': 'Disponible', 'cliente': None, 'reserva': None, 'obs': '', 'inicio': None, 'tipo_pago_priv': None, 'horas_extra_priv': 0, 'penalizaciones': 0} for n, t in HABITACIONES_STD}
-            st.session_state.habitaciones.update({p: {'numero': p, 'tipo': 'PRIVADA', 'estado': 'Disponible', 'cliente': None, 'reserva': None, 'obs': '', 'inicio': None, 'tipo_pago_priv': None, 'horas_extra_priv': 0, 'penalizaciones': 0} for p in PRIVADAS})
+            # Crear habitaciones por defecto
+            for numero, tipo in HABITACIONES_STD:
+                db_upsert("habitaciones", {
+                    "numero": numero, "tipo": tipo, "estado": "Disponible",
+                    "cliente": None, "reserva": None, "obs": "", "inicio": None,
+                    "tipo_pago_priv": None, "horas_extra_priv": 0, "penalizaciones": 0
+                })
+            for privada in PRIVADAS:
+                db_upsert("habitaciones", {
+                    "numero": privada, "tipo": "PRIVADA", "estado": "Disponible",
+                    "cliente": None, "reserva": None, "obs": "", "inicio": None,
+                    "tipo_pago_priv": None, "horas_extra_priv": 0, "penalizaciones": 0
+                })
+            st.session_state.habitaciones = {r['numero']: r for r in db_select("habitaciones")}
     
     # Cargar historial
     if 'historial_hab' not in st.session_state:
-        if DB_AVAILABLE:
-            db_hist = db_select("historial", {"tipo_registro": "HABITACION"})
-            st.session_state.historial_hab = [h['data'] for h in db_hist] if db_hist else []
-        else:
-            st.session_state.historial_hab = []
+        db_hist = db_select("historial", {"tipo_registro": "HABITACION"}, "created_at DESC")
+        st.session_state.historial_hab = [h['data'] for h in db_hist] if db_hist else []
     
     if 'historial_priv' not in st.session_state:
-        if DB_AVAILABLE:
-            db_hist = db_select("historial", {"tipo_registro": "PRIVADA"})
-            st.session_state.historial_priv = [h['data'] for h in db_hist] if db_hist else []
-        else:
-            st.session_state.historial_priv = []
+        db_hist = db_select("historial", {"tipo_registro": "PRIVADA"}, "created_at DESC")
+        st.session_state.historial_priv = [h['data'] for h in db_hist] if db_hist else []
     
     # Cargar empresas
     if 'empresas' not in st.session_state:
-        if DB_AVAILABLE:
-            db_emp = db_select("empresas")
-            st.session_state.empresas = {e['nombre']: e['rtn'] for e in db_emp} if db_emp else {}
-        else:
-            st.session_state.empresas = {}
+        db_emp = db_select("empresas")
+        st.session_state.empresas = {e['nombre']: e['rtn'] for e in db_emp} if db_emp else {}
 
 # ============================================================================
 # LOGIN SCREEN
@@ -273,11 +289,11 @@ def main_app():
         
         st.markdown("---")
         st.caption("💾 Estado de persistencia")
-        st.caption(f"{'✅ Conectado a Supabase' if DB_AVAILABLE else '⚠️ Modo local (datos temporales)'}")
+        st.caption("✅ Conectado a SQLite (datos persistentes)")
         
-        if DB_AVAILABLE and st.button("🔄 Sincronizar con nube", key="btn_sync"):
+        if st.button("🔄 Recargar datos", key="btn_sync"):
             init_session_state()
-            st.success("✅ Datos actualizados desde la nube")
+            st.success("✅ Datos actualizados")
 
     # ================= DASHBOARD =================
     if st.session_state.page == "Dashboard":
@@ -402,10 +418,8 @@ def main_app():
                                 registro['FACTURACION'] = f"{registro.get('FACTURACION', '')} + Penalización"
                                 break
                         
-                        # Guardar en Supabase
-                        if DB_AVAILABLE:
-                            db_upsert("habitaciones", hab, pk_column="numero")
-                            # Actualizar historial en DB (simplificado)
+                        # Guardar en DB
+                        db_upsert("habitaciones", hab)
                         
                         st.session_state.show_success = f"✅ Penalización de L 150 aplicada a {hab_sel}"
                         st.rerun()
@@ -423,8 +437,7 @@ def main_app():
                     if st.button("✅ Aceptar", key=f"btn_mant_ok_{hab_sel}"):
                         hab['estado'] = 'Mantenimiento'
                         hab['obs'] = f"🔧 {obs_mantenimiento}" if obs_mantenimiento else "🔧 En mantenimiento"
-                        if DB_AVAILABLE:
-                            db_upsert("habitaciones", hab, pk_column="numero")
+                        db_upsert("habitaciones", hab)
                         st.session_state.show_success = "Habitación en mantenimiento"
                         st.rerun()
                 with c_can:
@@ -442,14 +455,12 @@ def main_app():
                 hab['estado'] = 'Disponible'
                 hab['reserva'] = None
                 hab['obs'] = ''
-                if DB_AVAILABLE:
-                    db_upsert("habitaciones", hab, pk_column="numero")
+                db_upsert("habitaciones", hab)
                 st.session_state.show_success = "Reserva eliminada correctamente"
                 st.rerun()
             if c2.button("CAMBIAR DE ESTADO", key=f"btn_cambiar_{hab_sel}"):
                 hab['estado'] = st.selectbox("Nuevo estado", ESTADOS, index=0, key=f"estado_{hab_sel}")
-                if DB_AVAILABLE:
-                    db_upsert("habitaciones", hab, pk_column="numero")
+                db_upsert("habitaciones", hab)
                 st.session_state.show_success = "Estado cambiado correctamente"
                 st.rerun()
             if c3.button("VOLVER", key=f"btn_volver_{hab_sel}"):
@@ -468,8 +479,7 @@ def main_app():
                 hab['estado'] = nuevo
                 if nuevo != 'Mantenimiento':
                     hab['obs'] = ''
-                if DB_AVAILABLE:
-                    db_upsert("habitaciones", hab, pk_column="numero")
+                db_upsert("habitaciones", hab)
                 st.session_state.show_success = f"Estado cambiado a {nuevo}"
                 st.rerun()
         
@@ -568,10 +578,9 @@ def main_app():
                             'tipo_pago_priv': tipo_pago, 'horas_extra_priv': horas_extra_confirmadas, 'penalizaciones': 0
                         })
                         
-                        # Guardar en Supabase
-                        if DB_AVAILABLE:
-                            db_upsert("habitaciones", st.session_state.habitaciones[priv_sel], pk_column="numero")
-                            db_insert_historial("PRIVADA", registro)
+                        # Guardar en DB
+                        db_upsert("habitaciones", st.session_state.habitaciones[priv_sel])
+                        db_insert_historial("PRIVADA", registro)
                         
                         st.session_state.show_success = "Ya se realizó el pago"
                         st.session_state.form_counter_priv += 1
@@ -590,8 +599,7 @@ def main_app():
                     for _, row in df_emp.iterrows():
                         if 'EMPRESA' in row.columns and 'RTN' in row.columns:
                             st.session_state.empresas[row['EMPRESA']] = str(row['RTN'])
-                            if DB_AVAILABLE:
-                                db_upsert("empresas", {"nombre": row['EMPRESA'], "rtn": str(row['RTN'])}, pk_column="nombre")
+                            db_upsert("empresas", {"nombre": row['EMPRESA'], "rtn": str(row['RTN'])})
                     st.success(f"✅ {len(df_emp)} empresas cargadas correctamente.")
                 except Exception as e:
                     st.error(f"Error al cargar archivo: {e}")
@@ -607,8 +615,7 @@ def main_app():
                 if st.button("Agregar", key="btn_agregar_empresa"):
                     if nueva_empresa and nuevo_rtn:
                         st.session_state.empresas[nueva_empresa] = nuevo_rtn
-                        if DB_AVAILABLE:
-                            db_upsert("empresas", {"nombre": nueva_empresa, "rtn": nuevo_rtn}, pk_column="nombre")
+                        db_upsert("empresas", {"nombre": nueva_empresa, "rtn": nuevo_rtn})
                         st.success("✅ Empresa agregada")
                         st.rerun()
             
@@ -628,8 +635,7 @@ def main_app():
                 if emp_sel and rtn and rtn != rtn_default:
                     if st.button("Agregar esta empresa", key=f"btn_agr_emp_{emp_sel}_{st.session_state.form_counter_hab}"):
                         st.session_state.empresas[emp_sel] = rtn
-                        if DB_AVAILABLE:
-                            db_upsert("empresas", {"nombre": emp_sel, "rtn": rtn}, pk_column="nombre")
+                        db_upsert("empresas", {"nombre": emp_sel, "rtn": rtn})
                         st.success("✅ Empresa agregada al registro")
                         st.rerun()
                 
@@ -672,9 +678,9 @@ def main_app():
                         st.session_state.historial_hab.append(registro)
                         st.session_state.habitaciones[hab_sel].update({'estado': 'Ocupada', 'cliente': cl, 'obs': f"{dias} día(s) - {nom} {ape}"})
                         
-                        if DB_AVAILABLE:
-                            db_upsert("habitaciones", st.session_state.habitaciones[hab_sel], pk_column="numero")
-                            db_insert_historial("HABITACION", registro)
+                        # Guardar en DB
+                        db_upsert("habitaciones", st.session_state.habitaciones[hab_sel])
+                        db_insert_historial("HABITACION", registro)
                         
                         st.session_state.show_success = "Ya se realizó el pago"
                         st.session_state.form_counter_hab += 1
@@ -745,9 +751,9 @@ def main_app():
                             'cliente': cl, 'obs': obs
                         })
                         
-                        if DB_AVAILABLE:
-                            db_upsert("habitaciones", st.session_state.habitaciones[hab_sel], pk_column="numero")
-                            db_insert_historial("HABITACION", registro)
+                        # Guardar en DB
+                        db_upsert("habitaciones", st.session_state.habitaciones[hab_sel])
+                        db_insert_historial("HABITACION", registro)
                         
                         st.session_state.show_success = "Ya se realizó la reserva"
                         st.session_state.form_counter_res_pa += 1
@@ -763,8 +769,7 @@ def main_app():
                         'reserva': {'NOMBRE': nom, 'APELLIDO': ape, 'FECHA': f_res.isoformat() if isinstance(f_res, datetime) else str(f_res), 'DIAS_RESERVA': dias_reserva, 'PAGO_ANTICIPADO': False},
                         'obs': obs
                     })
-                    if DB_AVAILABLE:
-                        db_upsert("habitaciones", st.session_state.habitaciones[hab_sel], pk_column="numero")
+                    db_upsert("habitaciones", st.session_state.habitaciones[hab_sel])
                     st.session_state.show_success = "Ya se realizó la reserva"
                     st.session_state.form_counter_res_basica += 1
                     st.rerun()
@@ -776,7 +781,7 @@ def main_app():
     st.markdown(f"""
     <div style='text-align: center; color: gray; font-size: 12px;'>
         © 2026 Sistema de Hotelería CA13 | 
-        💾 {'Conectado a Supabase ✅' if DB_AVAILABLE else 'Modo local ⚠️'} |
+        💾 SQLite persistente |
         🔄 {datetime.now().strftime('%H:%M:%S')}
     </div>
     """, unsafe_allow_html=True)
