@@ -7,7 +7,7 @@ import hashlib
 from supabase import create_client, Client
 
 # ============================================================================
-# CONFIGURACIÓN INICIAL
+# CONFIGURACIÓN INICIAL G
 # ============================================================================
 st.set_page_config(page_title="Sistema Hotelero CA13", page_icon="🏨", layout="wide")
 
