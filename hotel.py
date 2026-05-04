@@ -6,6 +6,13 @@ import json
 import os
 from pathlib import Path
 import hashlib
+import supabase
+
+# Conecta a la base de datos (Usa tus keys de Supabase)
+SUPABASE_URL = "https://TU_URL_DE_SUPABASE.supabase.co"
+SUPABASE_KEY = "TU_LLAVE_ANON_DE_SUPABASE"
+
+sb = supabase.create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Configuración
 st.set_page_config(page_title="Sistema Hotelero", page_icon="🏨", layout="wide")
