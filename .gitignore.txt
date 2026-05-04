@@ -1,0 +1,6 @@
+# Datos locales (no subir a GitHub)
+hotel_data/
+*.json
+__pycache__/
+*.pyc
+.env
